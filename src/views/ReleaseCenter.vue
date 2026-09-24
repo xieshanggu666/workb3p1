@@ -1,0 +1,278 @@
+<script setup>
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { useKbStore } from '@/stores/kb'
+import { useAuthStore } from '@/stores/auth'
+import { useReleaseStore } from '@/stores/release'
+import DocPill from '@/components/common/DocPill.vue'
+import { formatDate, formatFull } from '@/utils/format'
+import {
+  GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
+  impactTypeLabel, impactStatusLabel, impactCounts, IMPACT
+} from '@/utils/release'
+import { diffVersionFields, fieldLabels } from '@/utils/version'
+
+const router = useRouter()
+const kb = useKbStore()
+const auth = useAuthStore()
+const releaseStore = useReleaseStore()
+
+const tab = ref('todo') // todo | mine | all
+const confirmNoteMap = ref({})
+const decideNoteMap = ref({})
+const rollbackNoteMap = ref({})
+const busyId = ref('')
+
+const isAdmin = computed(() => auth.user?.role === 'admin')
+const docById = computed(() => Object.fromEntries(kb.docs.map((d) => [d.id, d])))
+const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
+const userName = (id) => (id === 'system' ? '系统' : userById.value[id]?.name || id)
+
+const todoList = computed(() =>
+  releaseStore.sorted.filter((g) =>
+    g.status === GATE.PENDING_APPROVAL
+      ? isAdmin.value
+      : g.status === GATE.PENDING_CONFIRM && (isAdmin.value || g.ownerId === auth.user?.id)
+  )
+)
+const mineList = computed(() => releaseStore.sorted.filter((g) => g.submittedBy === auth.user?.id))
+const allList = computed(() => isAdmin.value ? releaseStore.sorted : releaseStore.sorted.filter((g) => g.submittedBy === auth.user?.id || g.ownerId === auth.user?.id))
+
+const list = computed(() => {
+  if (tab.value === 'todo') return todoList.value
+  if (tab.value === 'mine') return mineList.value
+  return allList.value
+})
+
+const counts = computed(() => ({
+  todo: todoList.value.length,
+  mine: mineList.value.length,
+  all: allList.value.length
+}))
+
+function changedFields(g) {
+  if (!g.candidateSnapshot || !g.publishedSnapshot) return []
+  return diffVersionFields(g.publishedSnapshot, g.candidateSnapshot)
+}
+
+async function confirmItem(g, key) {
+  const res = await releaseStore.confirmImpact(g.id, key, auth.user)
+  if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
+}
+
+async function confirmAll(g) {
+  if (g.impacts.some((it) => it.status === IMPACT.PENDING)) { alert('仍有影响项未逐项确认。'); return }
+  const res = await releaseStore.confirmGate(g.id, (confirmNoteMap.value[g.id] || '').trim(), auth.user)
+  if (res.status === 'ok') confirmNoteMap.value[g.id] = ''
+  else if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
+}
+
+async function withdraw(g) {
+  if (!confirm('确定撤回该发布门禁？候选版本将不发布。')) return
+  const res = await releaseStore.withdrawGate(g.id, auth.user)
+  if (res.status !== 'ok') alert('操作失败：门禁状态已变化')
+}
+
+async function decide(g, decision) {
+  if (busyId.value) return
+  busyId.value = g.id
+  try {
+    const res = await releaseStore.decideGate(g.id, decision, (decideNoteMap.value[g.id] || '').trim(), auth.user)
+    if (res.status === 'ok') decideNoteMap.value[g.id] = ''
+    else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
+    else alert('操作失败：门禁状态已变化')
+  } finally {
+    busyId.value = ''
+  }
+}
+
+async function rollback(g) {
+  if (!confirm('确定回退 v' + g.version + '？问答引用与共享链接将恢复到 v' + g.publishedVersion + '。')) return
+  const res = await releaseStore.rollbackGate(g.id, (rollbackNoteMap.value[g.id] || '').trim(), auth.user)
+  if (res.status === 'ok') rollbackNoteMap.value[g.id] = ''
+  else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以回退版本。')
+  else alert('操作失败：门禁状态已变化')
+}
+
+function impactIcon(type) {
+  return { citation: '🤖', ticket: '📮', share: '🔗' }[type] || '•'
+}
+
+onMounted(async () => {
+  await Promise.all([releaseStore.loadAll(), kb.loadAll()])
+})
+</script>
+
+<template>
+  <div class="gc-page">
+    <header class="head">
+      <h2>🚦 发布门禁</h2>
+      <p class="sub">编辑者提交版本后关联受影响的问答引用、缺口工单与共享链接 → 负责人确认影响 → 管理员审批放行或回退，版本发布、引用与链接状态自动回写。</p>
+      <div class="tabs">
+        <button :class="{ on: tab === 'todo' }" @click="tab = 'todo'">待我处理 <em>{{ counts.todo }}</em></button>
+        <button :class="{ on: tab === 'mine' }" @click="tab = 'mine'">我提交的 <em>{{ counts.mine }}</em></button>
+        <button :class="{ on: tab === 'all' }" @click="tab = 'all'">全部记录 <em>{{ counts.all }}</em></button>
+      </div>
+    </header>
+
+    <div v-if="!list.length" class="empty card">
+      <div class="ico">🚦</div>
+      {{ tab === 'todo' ? '暂无待你确认或审批的发布门禁' : tab === 'mine' ? '你还没有提交过发布门禁' : '暂无发布门禁记录' }}
+    </div>
+
+    <div v-else class="gate-list">
+      <div v-for="g in list" :key="g.id" class="gate card">
+        <div class="g-top" @click="docById[g.docId] && router.push('/docs/' + g.docId)">
+          <div class="g-main">
+            <span class="g-doc-title">{{ docById[g.docId]?.title || g.docTitle || '已删除文档' }}</span>
+            <DocPill v-if="docById[g.docId]" :doc="docById[g.docId]" />
+          </div>
+          <div class="g-side">
+            <span class="st" :class="gateStatusCls(g.status)">{{ gateStatusLabel(g.status) }}</span>
+            <span class="g-time">{{ formatDate(g.createdAt) }}</span>
+          </div>
+        </div>
+
+        <div class="g-info">
+          <span>{{ userName(g.submittedBy) }} 提交</span>
+          <span class="g-ver">v{{ g.publishedVersion }} → v{{ g.version }}</span>
+          <span v-if="changedFields(g).length" class="g-fields">变更：{{ fieldLabels(changedFields(g)).join('、') }}</span>
+          <span v-if="g.confirmedAt" class="g-confirmed">负责人 {{ userName(g.confirmedBy) }} 已确认</span>
+          <span v-if="g.decidedAt" class="g-decided">{{ userName(g.decidedBy) }} 于 {{ formatFull(g.decidedAt) }} {{ gateStatusLabel(g.status) }}</span>
+        </div>
+        <div v-if="g.note" class="g-note">变更说明：“{{ g.note }}”</div>
+        <div v-if="g.decisionNote" class="g-note">审批意见：“{{ g.decisionNote }}”</div>
+        <div v-if="g.rollbackNote" class="g-note">回退说明：“{{ g.rollbackNote }}”</div>
+
+        <!-- 影响项 -->
+        <div class="impacts">
+          <div class="imp-head">
+            受影响关联（{{ impactCounts(g.impacts).total }}）：
+            🤖 问答引用 {{ impactCounts(g.impacts).citation }} ·
+            📮 缺口工单 {{ impactCounts(g.impacts).ticket }} ·
+            🔗 共享链接 {{ impactCounts(g.impacts).share }}
+            <span v-if="g.status === GATE.PENDING_CONFIRM" class="imp-progress">已确认 {{ impactCounts(g.impacts).confirmed }}/{{ impactCounts(g.impacts).total }}</span>
+          </div>
+          <div v-if="!g.impacts.length" class="imp-empty">无关联影响项</div>
+          <div v-for="it in g.impacts" :key="it.key" class="impact" :class="'im-' + it.status">
+            <span class="im-ico">{{ impactIcon(it.type) }}</span>
+            <div class="im-body">
+              <div class="im-title">{{ it.title }}</div>
+              <div class="im-sub">
+                <span class="im-type">{{ impactTypeLabel(it.type) }}</span>
+                <span v-if="it.subtitle">{{ it.subtitle }}</span>
+              </div>
+            </div>
+            <span class="im-state">{{ impactStatusLabel(it.status) }}</span>
+            <button
+              v-if="g.status === GATE.PENDING_CONFIRM && (isAdmin || g.ownerId === auth.user?.id) && it.status === IMPACT.PENDING"
+              class="btn xs"
+              @click="confirmItem(g, it.key)"
+            >确认</button>
+          </div>
+        </div>
+
+        <!-- 操作区 -->
+        <div v-if="g.status === GATE.PENDING_CONFIRM && (isAdmin || g.ownerId === auth.user?.id)" class="acts">
+          <textarea :value="confirmNoteMap[g.id] || ''" rows="2" placeholder="影响确认意见（可选）" @input="confirmNoteMap[g.id] = $event.target.value"></textarea>
+          <div class="act-row">
+            <button class="btn sm ok-solid" @click="confirmAll(g)">确认影响并提交审批</button>
+            <button v-if="g.submittedBy === auth.user?.id || isAdmin" class="btn sm ghost" @click="withdraw(g)">撤回升版</button>
+          </div>
+        </div>
+
+        <div v-if="g.status === GATE.PENDING_APPROVAL && isAdmin" class="acts">
+          <textarea :value="decideNoteMap[g.id] || ''" rows="2" placeholder="审批意见（可选，将写入留痕时间线）" @input="decideNoteMap[g.id] = $event.target.value"></textarea>
+          <div class="act-row">
+            <button class="btn sm danger-ghost" :disabled="busyId === g.id" @click="decide(g, 'reject')">✕ 驳回（不发布）</button>
+            <button class="btn sm ok-solid" :disabled="busyId === g.id" @click="decide(g, 'approve')">✓ 审批放行并发布</button>
+          </div>
+        </div>
+
+        <div v-if="g.status === GATE.RELEASED && isAdmin" class="acts released-acts">
+          <div class="released-hint">已放行：问答引用切换至 v{{ g.version }}，共享链接已同步新版内容。如发现问题可回退。</div>
+          <div class="act-row">
+            <input :value="rollbackNoteMap[g.id] || ''" placeholder="回退原因（可选）" @input="rollbackNoteMap[g.id] = $event.target.value" />
+            <button class="btn sm danger-ghost" @click="rollback(g)">↩ 回退至 v{{ g.publishedVersion }}</button>
+          </div>
+        </div>
+
+        <details class="timeline">
+          <summary>查看留痕时间线（{{ (g.timeline || []).length }}）</summary>
+          <div v-for="(t, i) in g.timeline || []" :key="i" class="tl">
+            <span class="tl-act">{{ gateTimelineLabel(t.action) }}</span>
+            <span class="tl-who">{{ userName(t.by) }}</span>
+            <span v-if="t.note" class="tl-note">“{{ t.note }}”</span>
+            <span class="tl-tm">{{ formatFull(t.at) }}</span>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <p v-if="!isAdmin && tab === 'todo'" class="foot-tip">非管理员仅能看到待你（文档负责人）确认影响的门禁；审批放行由管理员完成。</p>
+  </div>
+</template>
+
+<style scoped>
+.gc-page { max-width: 920px; margin: 0 auto; }
+.head h2 { margin: 0 0 4px; }
+.sub { color: var(--text-2); font-size: 13px; margin: 0 0 14px; }
+.tabs { display: flex; gap: 8px; }
+.tabs button { border: 1px solid var(--border); background: var(--panel); padding: 7px 16px; border-radius: 999px; cursor: pointer; font-size: 13px; color: var(--text-2); }
+.tabs button.on { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
+.tabs em { font-style: normal; opacity: 0.7; margin-left: 2px; }
+.gate-list { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+.gate { padding: 16px 20px; }
+.g-top { display: flex; justify-content: space-between; gap: 14px; cursor: pointer; }
+.g-main { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.g-doc-title { font-weight: 700; font-size: 15px; }
+.g-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; white-space: nowrap; }
+.g-time { color: var(--text-3); font-size: 12px; }
+.st { font-size: 12px; padding: 2px 10px; border-radius: 999px; }
+.st-confirm { background: #e0e7ff; color: #4338ca; }
+.st-pending { background: #fef3c7; color: #b45309; }
+.st-ok { background: #dcfce7; color: #15803d; }
+.st-no { background: #fee2e2; color: #b91c1c; }
+.st-off { background: var(--panel-2); color: var(--text-3); }
+.st-rollback { background: #ffedd5; color: #c2410c; }
+.g-info { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--text-2); }
+.g-ver { font-weight: 600; color: var(--primary); }
+.g-fields { color: var(--text-3); font-size: 12px; }
+.g-confirmed { color: #4338ca; font-size: 12px; }
+.g-decided { font-size: 12px; color: var(--text-3); }
+.g-note { margin-top: 8px; font-size: 13px; color: var(--text-2); background: var(--panel-2); border-radius: 8px; padding: 8px 12px; }
+.impacts { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.imp-head { font-size: 12.5px; font-weight: 600; color: var(--text-2); margin-bottom: 8px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.imp-progress { color: #4338ca; }
+.imp-empty { font-size: 12.5px; color: var(--text-3); }
+.impact { display: flex; gap: 10px; align-items: flex-start; padding: 7px 8px; border-radius: 8px; }
+.impact.im-confirmed, .impact.im-released { background: #f0fdf4; }
+.impact.im-reverted { opacity: 0.65; }
+.im-ico { font-size: 14px; line-height: 1.5; }
+.im-body { flex: 1; min-width: 0; }
+.im-title { font-size: 13px; word-break: break-word; }
+.im-sub { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; font-size: 11.5px; color: var(--text-3); }
+.im-type { background: var(--primary-weak); color: var(--primary); border-radius: 999px; padding: 0 8px; }
+.im-state { font-size: 12px; color: #15803d; white-space: nowrap; }
+.im-pending .im-state { color: #b45309; }
+.im-reverted .im-state { color: var(--text-3); }
+.btn.xs { padding: 2px 10px; font-size: 12px; }
+.acts { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 12px; }
+.acts textarea, .acts input { width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; outline: none; }
+.acts textarea { resize: vertical; }
+.acts textarea:focus, .acts input:focus { border-color: var(--primary); }
+.act-row { display: flex; gap: 8px; margin-top: 8px; }
+.btn.ok-solid { background: #16a34a; border-color: #16a34a; color: #fff; }
+.btn.ok-solid:hover { background: #15803d; color: #fff; }
+.btn.danger-ghost { background: #fff; border-color: #f2555c; color: #b91c1c; }
+.btn.danger-ghost:hover { background: #fef2f2; }
+.released-hint { font-size: 12.5px; color: #15803d; margin-bottom: 8px; }
+.timeline { margin-top: 10px; }
+.timeline summary { cursor: pointer; font-size: 12px; color: var(--text-3); }
+.tl { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 4px 0; font-size: 12px; }
+.tl-act { font-weight: 600; color: var(--primary); min-width: 110px; }
+.tl-who { color: var(--text-2); min-width: 50px; }
+.tl-note { color: var(--text-2); flex: 1; }
+.tl-tm { color: var(--text-3); }
+.foot-tip { margin-top: 14px; color: var(--text-3); font-size: 12px; text-align: center; }
+</style>
