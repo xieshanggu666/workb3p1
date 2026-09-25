@@ -179,7 +179,7 @@ watch(token, () => resolve(token.value))
       </div>
 
       <div v-if="gatedShare" class="card gate-banner">
-        🚦 该文档有新版本正在发布门禁中（{{ gatedShare.status === 'pending_confirm' ? '待负责人确认影响' : '待管理员审批' }}），
+        🚦 该文档有新版本正在发布门禁中（{{ gatedShare.status === 'blocked' ? '准入阻断待处置' : gatedShare.status === 'pending_confirm' ? '待负责人确认影响' : '待管理员审批' }}），
         共享链接当前展示门禁前已发布版本；审批放行后链接内容将自动更新为新版本。
       </div>
 

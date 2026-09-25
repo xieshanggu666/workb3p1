@@ -3,6 +3,7 @@ import { db } from '@/db'
 import { uid, makeToken } from '@/utils/format'
 import { canCreateShare, canRevokeShare, GUEST_ID } from '@/utils/permission'
 import { ACCESS_PERM } from '@/utils/access'
+import { isGateStatusOpen } from '@/utils/release'
 
 // 共享链接 store：链接的创建与撤销统一收口于此。
 // 修复「分享管理 → 正文保存」权限升级：此前 ShareDialog 直接 db.shares.add，
@@ -28,7 +29,7 @@ export const useShareStore = defineStore('share', () => {
         .filter((rv) => rv.status === 'pending').first()
       // 发布门禁流转中：候选版本未放行，门禁锁定同样禁止再生成可编辑链接
       const gateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
-      const openGate = gateRec && (gateRec.status === 'pending_confirm' || gateRec.status === 'pending_approval') ? gateRec : null
+      const openGate = gateRec && isGateStatusOpen(gateRec.status) ? gateRec : null
       const grantReqs = await db.accessRequests
         .where('docId').equals(docId)
         .filter((r) => r.applicantId === userId).toArray()

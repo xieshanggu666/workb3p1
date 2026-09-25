@@ -4,27 +4,38 @@ import { db } from '@/db'
 import { uid } from '@/utils/format'
 import { ensureVersions, docSnapshot } from '@/utils/version'
 import {
-  GATE, RELEASE_STATE, IMPACT, IMPACT_TYPE,
-  isGateOpen, isGatePendingConfirm, isGatePendingApproval, isGateReleased,
+  GATE, RELEASE_STATE, IMPACT, IMPACT_TYPE, CHECK_KEY, CHECK_STATUS,
+  isGateOpen, isGateBlocked,
   canSubmitGate, canConfirmGate, canWithdrawGate, canDecideGate, canRollbackGate,
+  canRecheckGate, canSignOffCheck,
   normalizeImpacts, markImpactConfirmed, allImpactsConfirmed,
   markImpactsReleased, markImpactsReset, impactCounts,
-  buildGateEntry
+  restoreConfirmedImpacts, evaluateGateChecks, mergeChecks, signOffGateCheck,
+  allChecksCleared, blockingReasons, buildGateEntry
 } from '@/utils/release'
 import { canEditDoc, GUEST_ID, ROLE } from '@/utils/permission'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { shareStatus } from '@/utils/share'
 import { isItemOpen } from '@/utils/handover'
+import { isFreshTicketOpen } from '@/utils/freshness'
+import { GAP } from '@/utils/gap'
+import { isRetirementOpen, isRetirementActive } from '@/utils/retirement'
 import { useKbStore } from './kb'
 
-// 知识变更影响评估与发布门禁 store：
+// 知识变更影响评估与发布门禁 store（统一治理状态机）：
 // 编辑者保存新版本后「提交发布门禁」（submitGate）：
 //   同事务锁定候选版本、把文档对外内容回退到门禁前已发布快照、自动关联受影响的
-//   问答引用（qaCitations 命中记录）、缺口工单（gapTickets 关联/来源为本文档）与共享链接（shares）；
-// 负责人（拥有者）逐项确认影响并整体确认（confirmImpact / confirmGate）→ pending_approval；
-// 管理员审批放行（decideGate approve）：候选快照回写文档、追加发布版本标记、问答引用切换到新版、
-//   共享链接状态同步；驳回（reject）/编辑者撤回（withdraw）：版本不发布，文档保持已发布版；
+//   问答引用（qaCitations 命中记录）、缺口工单（gapTickets 关联/来源为本文档）与共享链接（shares），
+//   并对四个治理维度做准入检查（评审结论 / 知识保鲜 / 未解决缺口 / 退役关系）：
+//   全部通过 → pending_confirm；存在阻断 → blocked，阻断原因回写门禁单与关联实体时间线；
+// 责任人在外部处置阻断后「重新评估」（recheckGate：硬阻断须消除），或对软阻断维度
+//   由对应责任角色「豁免」（signOffCheck：保鲜→负责人/管理员，缺口→编辑者/管理员）；
+//   全部维度通过后进入 pending_confirm（负责人逐项确认影响）→ pending_approval；
+// 管理员审批放行（decideGate approve；放行前再次复检，阻断若复现则退回 blocked）：候选快照回写文档、
+//   追加发布版本标记、问答引用切换到新版、共享链接状态同步；
+//   驳回（reject）/编辑者撤回（withdraw）：版本不发布，文档保持已发布版；
 // 已放行版本管理员可回退（rollbackGate）：正文与问答引用恢复到发布前版本、链接状态还原。
+// 驳回/撤回/回退后重新发起门禁：上一轮已逐项确认的影响自动恢复确认态（状态恢复）。
 // 全程在门禁单 timeline、版本记录门禁标记与各影响实体上留痕。
 export const useReleaseStore = defineStore('release', () => {
   const gates = ref([])
@@ -44,7 +55,7 @@ export const useReleaseStore = defineStore('release', () => {
     [...gates.value].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
   )
 
-  // 某文档当前在途门禁（同一文档同时只允许一个）
+  // 某文档当前在途门禁（同一文档同时只允许一个，含阻断态）
   const openByDoc = computed(() => {
     const m = {}
     for (const g of gates.value) {
@@ -66,6 +77,17 @@ export const useReleaseStore = defineStore('release', () => {
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
   }
 
+  // 准入阻断中、当前用户可处置（重新评估/豁免）的门禁
+  function blockedFor(userId, role, isOwnerOf = () => false) {
+    if (!userId || userId === GUEST_ID) return []
+    return sorted.value.filter((g) => {
+      if (!isGateBlocked(g)) return false
+      const ctx = { userId, role, isOwner: isOwnerOf(g) || g.ownerId === userId }
+      if (canRecheckGate(g, ctx)) return true
+      return (g.checks || []).some((c) => canSignOffCheck(c, ctx))
+    })
+  }
+
   // 待我确认影响（文档拥有者视角；管理员也可确认）
   function pendingConfirmFor(userId, role) {
     return sorted.value.filter((g) => {
@@ -84,9 +106,11 @@ export const useReleaseStore = defineStore('release', () => {
     return sorted.value.filter((g) => g.submittedBy === userId)
   }
 
-  // 侧栏角标：负责人待确认数 + （管理员）待审批数
+  // 侧栏角标：准入阻断待处置 + 负责人待确认数 + （管理员）待审批数
   function pendingCountFor(userId, role) {
-    return pendingConfirmFor(userId, role).length + (role === ROLE.ADMIN ? pendingApprovalFor(role).length : 0)
+    return blockedFor(userId, role).length
+      + pendingConfirmFor(userId, role).length
+      + (role === ROLE.ADMIN ? pendingApprovalFor(role).length : 0)
   }
 
   // 问答产生引用时记录（QAAssistant 提问后调用）：每条命中一条，便于门禁关联受影响引用。
@@ -131,15 +155,18 @@ export const useReleaseStore = defineStore('release', () => {
       if (citations.length >= 20) break
     }
 
-    // ② 缺口工单：答案来源已回填本文档（resolved）或处理中已关联本文档的工单
+    // ② 缺口工单：仅已解决（答案来源已回填本文档）的工单作为发布影响项；
+    //    未解决工单（open/claimed/in_review）归「未解决缺口」准入检查维度，不在影响项中重复
     const ticketRows = await db.gapTickets.where('docId').equals(docId).toArray()
-    const tickets = ticketRows.map((t) => ({
-      type: IMPACT_TYPE.TICKET,
-      refId: t.id,
-      title: t.question,
-      subtitle: t.status === 'resolved' ? '已解决 · 答案来源为本文档' : '处理中 · 已关联本文档',
-      before: { status: t.status }
-    }))
+    const tickets = ticketRows
+      .filter((t) => t.status === GAP.RESOLVED)
+      .map((t) => ({
+        type: IMPACT_TYPE.TICKET,
+        refId: t.id,
+        title: t.question,
+        subtitle: '已解决 · 答案来源为本文档',
+        before: { status: t.status }
+      }))
 
     // ③ 共享链接：当前仍有效（未撤销/未过期）的链接随门禁纳入评估；记录撤销前状态供回退还原
     const shareRows = await db.shares.where('docId').equals(docId).toArray()
@@ -157,9 +184,40 @@ export const useReleaseStore = defineStore('release', () => {
     return normalizeImpacts([...citations, ...tickets, ...shares])
   }
 
+  // 事务内收集四个治理维度的准入检查上下文
+  async function collectChecksCtxTx(docId, doc) {
+    const openReview = await db.reviews
+      .where('docId').equals(docId)
+      .filter((rv) => rv.status === 'pending').first()
+
+    let activeFreshTicket = null
+    const activeRef = doc?.freshness?.activeTicket
+    if (activeRef && typeof activeRef === 'object') {
+      activeFreshTicket = isFreshTicketOpen(activeRef) ? activeRef : null
+    }
+    if (!activeFreshTicket) {
+      activeFreshTicket = await db.freshnessTickets
+        .where('docId').equals(docId)
+        .filter((t) => isFreshTicketOpen(t))
+        .last() || null
+    }
+
+    const openGapTickets = (await db.gapTickets.where('docId').equals(docId).toArray())
+      .filter((t) => t.status !== GAP.RESOLVED)
+
+    const retireRows = await db.retirements.where('docId').equals(docId).toArray()
+    const activeRetirement = retireRows.find((r) => isRetirementActive(r)) || null
+    const openRetirement = retireRows.find((r) => isRetirementOpen(r)) || null
+    // 本文档正作为他人在途退役的替代文档（替代链审批变动中；replacementDocId 无索引，全表过滤）
+    const usedAsReplacementOpen = (await db.retirements.toArray())
+      .find((r) => isRetirementOpen(r) && r.replacementDocId === docId && r.docId !== docId) || null
+
+    return { openReview, activeFreshTicket, openGapTickets, activeRetirement, openRetirement, usedAsReplacementOpen }
+  }
+
   // 提交发布门禁。
   // payload: { docId, note, citationIds?（额外勾选的引用，默认自动收集）, ticketIds?, shareIds? }
-  // 返回 { status:'ok', gate } | 'guest' | 'denied' | 'missing' | 'no-change' | 'duplicate' | 'in-review'
+  // 返回 { status:'ok'|'blocked', gate } | 'guest' | 'denied' | 'missing' | 'no-change' | 'duplicate' | 'in-handover'
   async function submitGate(payload, currentUser) {
     const kb = useKbStore()
     await kb.loadAll()
@@ -171,15 +229,13 @@ export const useReleaseStore = defineStore('release', () => {
 
     await db.transaction(
       'rw',
-      db.docs, db.releaseGates, db.reviews, db.accessRequests, db.shares, db.gapTickets, db.qaCitations, db.handovers,
+      db.docs, db.releaseGates, db.reviews, db.accessRequests, db.shares, db.gapTickets, db.qaCitations,
+      db.handovers, db.freshnessTickets, db.retirements,
       async () => {
         const doc = await db.docs.get(payload.docId)
         if (!doc) { result = { status: 'missing' }; return }
         const versions = ensureVersions(doc, now)
         const candidateVersion = versions.length
-        const openReview = await db.reviews
-          .where('docId').equals(doc.id)
-          .filter((rv) => rv.status === 'pending').first()
         // 责任交接流转中：批准交接会按快照校验并发变更，门禁先完成/撤回再发起
         const openHandover = await db.handovers
           .filter((h) => (h.items || []).some((i) => i.docId === doc.id && isItemOpen(i))).first()
@@ -195,10 +251,14 @@ export const useReleaseStore = defineStore('release', () => {
             .filter((r) => r.applicantId === userId).toArray()
           grant = reqs.find((r) => isGrantActive(r) && r.grant?.permission === ACCESS_PERM.COLLAB) || null
         }
-        const canEdit = canEditDoc(doc, { userId, role, grant, pendingReview: openReview })
-        if (!canSubmitGate(doc, { userId, role, canEditDoc: canEdit, pendingReview: openReview, openGate: dupGate })) {
+        // 评审结论不再前置拒绝：评审中由管理员发起的门禁允许建档，统一状态机以「评审结论」维度阻断
+        const openReviewForLock = await db.reviews
+          .where('docId').equals(doc.id)
+          .filter((rv) => rv.status === 'pending').first()
+        const canEdit = canEditDoc(doc, { userId, role, grant, pendingReview: openReviewForLock })
+        if (!canSubmitGate(doc, { userId, role, canEditDoc: canEdit, pendingReview: openReviewForLock, openGate: dupGate })) {
           if (userId === GUEST_ID) { result = { status: 'guest' }; return }
-          if (openReview) { result = { status: 'in-review' }; return }
+          if (openReviewForLock) { result = { status: 'in-review' }; return }
           if (openHandover) { result = { status: 'in-handover' }; return }
           if (dupGate) { result = { status: 'duplicate', gate: dupGate }; return }
           result = { status: 'denied' }
@@ -236,20 +296,48 @@ export const useReleaseStore = defineStore('release', () => {
           })
         }
 
+        // 四个治理维度准入检查（评审结论 / 知识保鲜 / 未解决缺口 / 退役关系）
+        const checkCtx = await collectChecksCtxTx(doc.id, doc)
+        const checks = evaluateGateChecks({ ...checkCtx, doc }, now).map((c) => (c.status === CHECK_STATUS.BLOCKED
+          ? { ...c, firstBlockedAt: now, blockers: (c.blockers || []).map((b) => ({ ...b, firstMarkedAt: now })) }
+          : c))
+        const blocked = !allChecksCleared(checks)
+
+        // 状态恢复：上一轮门禁（驳回/撤回/回退）中已逐项确认的影响自动恢复确认态
+        const prevGate = (await db.releaseGates.where('docId').equals(doc.id).toArray())
+          .filter((g) => [GATE.REJECTED, GATE.WITHDRAWN, GATE.ROLLED_BACK].includes(g.status))
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]
+        let restoredCount = 0
+        if (prevGate) {
+          impacts = restoreConfirmedImpacts(impacts, prevGate.impacts, prevGate.id)
+          restoredCount = impacts.filter((it) => it.restoredFromGateId === prevGate.id).length
+        }
+
         const publishedVersion = doc.release?.publishedVersion ?? (candidateVersion - 1)
+        const timeline = [buildGateEntry('submit', userId, payload.note || ('v' + candidateVersion + ' 提交发布门禁，待准入检查与影响确认'), now)]
+        if (restoredCount > 0) {
+          timeline.push(buildGateEntry('impact-restore', 'system', '恢复上轮门禁中已确认的 ' + restoredCount + ' 项影响（沿用上轮确认结论）', now))
+        }
+        if (blocked) {
+          const reasons = checks.filter((c) => c.status === CHECK_STATUS.BLOCKED)
+            .map((c) => c.label + '：' + (c.blockers[0]?.reason || '存在阻断'))
+          timeline.push(buildGateEntry('check-blocked', 'system', reasons.join('；'), now))
+        }
         const gate = {
           id: uid('gate'),
           docId: doc.id,
           docTitle: doc.title,
-          status: GATE.PENDING_CONFIRM,
+          status: blocked ? GATE.BLOCKED : GATE.PENDING_CONFIRM,
           version: candidateVersion,
           publishedVersion,
           submittedBy: userId,
           ownerId: doc.ownerId,
           note: String(payload.note || '').trim(),
+          checks,
           impacts,
           candidateSnapshot: { ...candidateSnap, tagIds: [...(candidateSnap.tagIds || [])] },
           publishedSnapshot: published,
+          restoredFromGateId: restoredCount > 0 ? prevGate.id : null,
           confirmedBy: null,
           confirmedAt: null,
           decidedBy: null,
@@ -260,12 +348,14 @@ export const useReleaseStore = defineStore('release', () => {
           rollbackNote: '',
           releasedAt: null,
           createdAt: now,
-          timeline: [buildGateEntry('submit', userId, payload.note || ('v' + candidateVersion + ' 提交发布门禁，待负责人确认影响'), now)]
+          timeline
         }
         await db.releaseGates.add(gate)
 
-        // 文档进入门禁中：对外内容锁定为已发布快照，候选版本不提前泄露；
-        // 当前字段先不改动（候选内容已经在 doc 上），通过 doc.release 标记让展示/问答/搜索统一回退显示已发布版
+        // 阻断原因回写到关联实体时间线（仅新增标记，幂等由重新评估侧的新增集合控制）
+        await writeBlockerMarksTx(checks, gate, now, true)
+
+        // 文档进入门禁中（含阻断态）：对外内容锁定为已发布快照，候选版本不提前泄露
         const releaseInfo = {
           state: RELEASE_STATE.GATED,
           activeGateId: gate.id,
@@ -275,17 +365,131 @@ export const useReleaseStore = defineStore('release', () => {
         }
         await db.docs.update(doc.id, { release: releaseInfo })
 
-        // 候选版本记录打上门禁标记（版本历史中可见「待影响确认」）
+        // 候选版本记录打上门禁标记（版本历史中可见「准入阻断」/「待影响确认」）
         const newVersions = versions.map((v) =>
           v.version === candidateVersion
-            ? { ...v, gate: { gateId: gate.id, version: candidateVersion, status: GATE.PENDING_CONFIRM, at: now } }
+            ? { ...v, gate: { gateId: gate.id, version: candidateVersion, status: gate.status, at: now } }
             : v
         )
         await db.docs.update(doc.id, { versions: newVersions })
 
-        result = { status: 'ok', gate }
+        result = { status: blocked ? 'blocked' : 'ok', gate }
       }
     )
+
+    await Promise.all([reload(), kb.reloadDocs()])
+    return result
+  }
+
+  // 责任人重新评估准入状态：重新读取四个维度最新状态，硬阻断须已消除；
+  // 软阻断若仍存在保持阻断（可另行豁免）；全部通过后 blocked → pending_confirm。
+  async function recheckGate(gateId, currentUser) {
+    const kb = useKbStore()
+    await loadAll()
+    const now = new Date().toISOString()
+    const userId = currentUser?.id || GUEST_ID
+    const role = currentUser?.role || null
+    let result = { status: 'error' }
+
+    await db.transaction(
+      'rw',
+      db.releaseGates, db.docs, db.reviews, db.gapTickets, db.freshnessTickets, db.retirements,
+      async () => {
+        const gate = await db.releaseGates.get(gateId)
+        if (!gate) { result = { status: 'missing' }; return }
+        const doc = await db.docs.get(gate.docId)
+        if (!doc) { result = { status: 'doc-missing' }; return }
+        const roleCtx = { userId, role, isOwner: doc.ownerId === userId }
+        if (!canRecheckGate(gate, roleCtx)) {
+          result = userId === GUEST_ID ? { status: 'guest' } : { status: 'denied' }
+          return
+        }
+
+        const ctx = await collectChecksCtxTx(gate.docId, doc)
+        const nextChecks = evaluateGateChecks({ ...ctx, doc }, now)
+        const { checks, newlyBlocked, clearedKeys } = mergeChecks(gate.checks, nextChecks, now)
+
+        const timeline = [...(gate.timeline || [])]
+        for (const key of clearedKeys) {
+          const label = { [CHECK_KEY.REVIEW]: '评审结论', [CHECK_KEY.FRESH]: '知识保鲜', [CHECK_KEY.GAP]: '未解决缺口', [CHECK_KEY.RETIRE]: '退役关系' }[key]
+          timeline.push(buildGateEntry('check-recheck', 'system', label + '维度阻断已消除', now))
+        }
+        for (const [key, blockers] of Object.entries(newlyBlocked)) {
+          const label = { [CHECK_KEY.REVIEW]: '评审结论', [CHECK_KEY.FRESH]: '知识保鲜', [CHECK_KEY.GAP]: '未解决缺口', [CHECK_KEY.RETIRE]: '退役关系' }[key]
+          timeline.push(buildGateEntry('check-blocked', 'system', label + '维度新增阻断：' + blockers.map((b) => b.reason).join('；'), now))
+        }
+        if (!clearedKeys.length && !Object.keys(newlyBlocked).length) {
+          timeline.push(buildGateEntry('check-recheck', userId, '重新评估：仍有阻断维度未消除', now))
+        }
+
+        // 关联实体侧的阻断/消除留痕
+        await writeBlockerMarksTx(checks, gate, now, true)
+        await writeClearMarksTx(gate.checks, checks, gate, now)
+
+        const cleared = allChecksCleared(checks)
+        let status = gate.status
+        if (cleared) {
+          status = GATE.PENDING_CONFIRM
+          timeline.push(buildGateEntry('check-clear', 'system', '全部准入维度通过，进入影响确认环节', now))
+        }
+        const updated = { ...gate, checks, status, timeline }
+        await db.releaseGates.put(updated)
+
+        // 版本门禁标记同步
+        if (doc) {
+          const versions = (doc.versions || []).map((v) =>
+            v.gate?.gateId === gateId ? { ...v, gate: { ...v.gate, status, at: now } } : v
+          )
+          await db.docs.update(doc.id, { versions })
+        }
+        result = { status: 'ok', gate: updated, cleared, blocking: blockingReasons(updated) }
+      }
+    )
+
+    await Promise.all([reload(), kb.reloadDocs()])
+    return result
+  }
+
+  // 责任人对软阻断维度做跨角色豁免（保鲜→文档负责人/管理员；缺口→编辑者/管理员）。
+  // 豁免后该维度记为通过；全部维度通过则 blocked → pending_confirm。
+  async function signOffCheck(gateId, checkKey, note, currentUser) {
+    const kb = useKbStore()
+    await loadAll()
+    const now = new Date().toISOString()
+    const userId = currentUser?.id || GUEST_ID
+    const role = currentUser?.role || null
+    let result = { status: 'error' }
+
+    await db.transaction('rw', db.releaseGates, db.docs, async () => {
+      const gate = await db.releaseGates.get(gateId)
+      if (!gate) { result = { status: 'missing' }; return }
+      const doc = await db.docs.get(gate.docId)
+      const roleCtx = { userId, role, isOwner: !!doc && doc.ownerId === userId }
+      if (userId === GUEST_ID) { result = { status: 'guest' }; return }
+      const target = (gate.checks || []).find((c) => c.key === checkKey)
+      if (!canSignOffCheck(target, roleCtx)) { result = { status: 'denied' }; return }
+
+      const checks = signOffGateCheck(gate.checks, checkKey, roleCtx, note, now)
+      const timeline = [...(gate.timeline || []),
+        buildGateEntry('check-signoff', userId, (target.label || checkKey) + '维度豁免放行' + (note ? '：' + String(note).trim() : ''), now)]
+
+      const cleared = allChecksCleared(checks)
+      let status = gate.status
+      if (cleared) {
+        status = GATE.PENDING_CONFIRM
+        timeline.push(buildGateEntry('check-clear', 'system', '全部准入维度通过（含责任人豁免），进入影响确认环节', now))
+      }
+      const updated = { ...gate, checks, status, timeline }
+      await db.releaseGates.put(updated)
+
+      if (doc) {
+        const versions = (doc.versions || []).map((v) =>
+          v.gate?.gateId === gateId ? { ...v, gate: { ...v.gate, status, at: now } } : v
+        )
+        await db.docs.update(doc.id, { versions })
+      }
+      result = { status: 'ok', gate: updated, cleared }
+    })
 
     await Promise.all([reload(), kb.reloadDocs()])
     return result
@@ -358,7 +562,7 @@ export const useReleaseStore = defineStore('release', () => {
     return result
   }
 
-  // 编辑者撤回门禁（确认前 / 待审批均可）
+  // 编辑者撤回门禁（阻断态 / 确认前 / 待审批均可）
   async function withdrawGate(gateId, currentUser) {
     const kb = useKbStore()
     await loadAll()
@@ -397,6 +601,7 @@ export const useReleaseStore = defineStore('release', () => {
     await db.transaction(
       'rw',
       db.releaseGates, db.docs, db.shares, db.gapTickets, db.qaCitations,
+      db.reviews, db.freshnessTickets, db.retirements,
       async () => {
         const gate = await db.releaseGates.get(gateId)
         if (!gate) { result = { status: 'missing' }; return }
@@ -420,6 +625,30 @@ export const useReleaseStore = defineStore('release', () => {
           await db.releaseGates.put(rejected)
           await clearDocGateTx(gate, now, GATE.REJECTED)
           result = { status: 'ok', gate: rejected, approved: false }
+          return
+        }
+
+        // ---- 放行前最终复检：流转期间可能新出现阻断（如保鲜到点、被纳入他人退役替代链）----
+        const ctx = await collectChecksCtxTx(gate.docId, doc)
+        const nextChecks = evaluateGateChecks({ ...ctx, doc }, now)
+        const { checks, newlyBlocked } = mergeChecks(gate.checks, nextChecks, now)
+        if (!allChecksCleared(checks)) {
+          const timeline = [...(gate.timeline || [])]
+          for (const [key, blockers] of Object.entries(newlyBlocked)) {
+            const label = { [CHECK_KEY.REVIEW]: '评审结论', [CHECK_KEY.FRESH]: '知识保鲜', [CHECK_KEY.GAP]: '未解决缺口', [CHECK_KEY.RETIRE]: '退役关系' }[key]
+            timeline.push(buildGateEntry('check-blocked', 'system', '放行前复检发现新阻断（' + label + '）：' + blockers.map((b) => b.reason).join('；'), now))
+          }
+          if (!Object.keys(newlyBlocked).length) {
+            timeline.push(buildGateEntry('check-blocked', 'system', '放行前复检未通过：仍有准入阻断维度', now))
+          }
+          const bounced = { ...gate, status: GATE.BLOCKED, checks, timeline }
+          await db.releaseGates.put(bounced)
+          await writeBlockerMarksTx(checks, gate, now, true)
+          const versions = (doc.versions || []).map((v) =>
+            v.gate?.gateId === gateId ? { ...v, gate: { ...v.gate, status: GATE.BLOCKED, at: now } } : v
+          )
+          await db.docs.update(doc.id, { versions })
+          result = { status: 'blocked', gate: bounced, blocking: blockingReasons(bounced) }
           return
         }
 
@@ -498,6 +727,7 @@ export const useReleaseStore = defineStore('release', () => {
         const counts = impactCounts(gate.impacts)
         const released = {
           ...gate,
+          checks,
           status: GATE.RELEASED,
           decidedBy: userId,
           decidedAt: now,
@@ -637,9 +867,10 @@ export const useReleaseStore = defineStore('release', () => {
   return {
     gates, loaded, loadAll, reload, sorted,
     openGateOfDoc, gateById, gatesOfDoc,
-    pendingConfirmFor, pendingApprovalFor, submittedBy, pendingCountFor,
+    blockedFor, pendingConfirmFor, pendingApprovalFor, submittedBy, pendingCountFor,
     recordCitations, collectImpactsTx,
-    submitGate, confirmImpact, confirmGate, withdrawGate, decideGate, rollbackGate,
+    submitGate, recheckGate, signOffCheck,
+    confirmImpact, confirmGate, withdrawGate, decideGate, rollbackGate,
     resetGatesOfDocTx
   }
 })
@@ -653,6 +884,79 @@ function sortSnap(s) {
     categoryId: s?.categoryId ?? null,
     tagIds: [...(s?.tagIds || [])].sort(),
     visibility: s?.visibility || 'public'
+  }
+}
+
+// 阻断原因回写到关联实体时间线（保鲜复核单 / 缺口工单 / 退役单）。
+// 同一门禁同一 blocker 只写一次（gateBlockerMarks 记录已写集合）；评审维度不回写评审单
+// （评审单有独立的审批时间线，阻断原因在门禁单内可见即可）。
+// 调用方须已在写事务内。
+async function writeBlockerMarksTx(checks, gate, now, _isNew) {
+  const tableOf = {
+    [CHECK_KEY.FRESH]: db.freshnessTickets,
+    [CHECK_KEY.GAP]: db.gapTickets,
+    [CHECK_KEY.RETIRE]: db.retirements
+  }
+  for (const check of checks || []) {
+    if (check.status !== CHECK_STATUS.BLOCKED) continue
+    const table = tableOf[check.key]
+    if (!table) continue
+    for (const b of check.blockers || []) {
+      if (!b || b.id === 'due') continue
+      const entity = await table.get(b.id)
+      if (!entity) continue
+      const already = (entity.timeline || []).some(
+        (t) => t.action === 'gate-blocked' && t.gateId === gate.id
+      )
+      if (already) continue
+      await table.update(b.id, {
+        timeline: [...(entity.timeline || []), {
+          action: 'gate-blocked',
+          by: 'system',
+          note: '《' + (gate.docTitle || '文档') + '》v' + gate.version + ' 发布门禁被「' + check.label + '」维度阻断：' + b.reason,
+          at: now,
+          gateId: gate.id
+        }]
+      })
+    }
+  }
+}
+
+// 阻断消除时在关联实体侧补一条消除留痕（与 writeBlockerMarksTx 配对，幂等）。
+async function writeClearMarksTx(prevChecks, nextChecks, gate, now) {
+  const tableOf = {
+    [CHECK_KEY.FRESH]: db.freshnessTickets,
+    [CHECK_KEY.GAP]: db.gapTickets,
+    [CHECK_KEY.RETIRE]: db.retirements
+  }
+  const nextByKey = Object.fromEntries((nextChecks || []).map((c) => [c.key, c]))
+  for (const prev of prevChecks || []) {
+    if (prev.status !== CHECK_STATUS.BLOCKED) continue
+    const next = nextByKey[prev.key]
+    if (!next || next.status !== CHECK_STATUS.PASS || next.waiver) continue
+    const table = tableOf[prev.key]
+    if (!table) continue
+    for (const b of prev.blockers || []) {
+      if (!b || b.id === 'due') continue
+      const entity = await table.get(b.id)
+      if (!entity) continue
+      const already = (entity.timeline || []).some(
+        (t) => t.action === 'gate-blocked' && t.gateId === gate.id && /已消除/.test(t.note || '')
+      )
+      if (already) continue
+      const hasMark = (entity.timeline || []).some((t) => t.action === 'gate-blocked' && t.gateId === gate.id)
+      if (!hasMark) continue
+      await table.update(b.id, {
+        timeline: [...(entity.timeline || []), {
+          action: 'gate-blocked',
+          by: 'system',
+          note: '《' + (gate.docTitle || '文档') + '》v' + gate.version + ' 发布门禁「' + prev.label + '」阻断已消除',
+          at: now,
+          gateId: gate.id,
+          cleared: true
+        }]
+      })
+    }
   }
 }
 

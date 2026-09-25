@@ -264,7 +264,9 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
         <a v-if="kb.docs.find((d) => d.id === activeRetirement.replacementDocId)" class="rt-go" @click="router.push('/docs/' + activeRetirement.replacementDocId)">前往替代文档《{{ activeRetirement.replacementTitle }}》→</a>
       </div>
       <div v-if="openGate" class="card gate-banner">
-        <span>🚦 发布门禁中（{{ gateStatusLabel(openGate.status) }}）：v{{ openGate.version }} 待{{ openGate.status === 'pending_confirm' ? '负责人确认影响' : '管理员审批放行' }}，
+        <span v-if="openGate.status === 'blocked'">🚦 发布门禁准入阻断（{{ (openGate.checks || []).filter((c) => c.status === 'blocked').map((c) => c.label).join('、') }}）：
+          请责任角色处置阻断或豁免后继续；阻断期间正文/问答/搜索/共享链接展示已发布 v{{ openGate.publishedVersion }}。</span>
+        <span v-else>🚦 发布门禁中（{{ gateStatusLabel(openGate.status) }}）：v{{ openGate.version }} 待{{ openGate.status === 'pending_confirm' ? '负责人确认影响' : '管理员审批放行' }}，
           当前正文/问答/搜索/共享链接展示的是已发布 v{{ openGate.publishedVersion }}；放行后候选版本才会对外可见，回退则保持现版本。</span>
         <a class="rt-go" @click="router.push('/releases')">前往发布门禁 →</a>
       </div>
@@ -502,6 +504,7 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
 .vb-fresh { background: #cffafe; color: #0e7490; }
 .vb-cor { background: #ffe4e6; color: #be123c; }
 .vb-gate-ok { background: #dcfce7; color: #15803d; }
+.vb-gate-blocked { background: #fee2e2; color: #b91c1c; }
 .vb-gate-confirm { background: #e0e7ff; color: #4338ca; }
 .vb-gate-wait { background: #fef3c7; color: #b45309; }
 .vb-gate-no { background: #fee2e2; color: #b91c1c; }

@@ -376,7 +376,9 @@ const editableNow = computed(() => !lockedByReview.value && !lockedByGate.value 
       <div class="gate-lock-head">🚦 新版本发布门禁中，暂不可编辑</div>
       <div class="lock-desc">
         v{{ activeGate?.version }} 已由 {{ activeGate ? userById[activeGate.submittedBy] : '' }} 提交发布门禁，
-        当前{{ activeGate?.status === 'pending_confirm' ? '等待文档负责人确认影响' : '等待管理员审批放行' }}；
+        当前{{ activeGate?.status === 'blocked'
+          ? '存在准入阻断维度（评审/保鲜/缺口/退役），等待责任角色处置或豁免'
+          : activeGate?.status === 'pending_confirm' ? '等待文档负责人确认影响' : '等待管理员审批放行' }}；
         放行后新版本才对外发布，驳回或撤回则保持当前已发布版本。
       </div>
       <div class="lock-actions">

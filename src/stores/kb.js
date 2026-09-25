@@ -8,6 +8,7 @@ import { GAP } from '@/utils/gap'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { canEditContent, canEditDoc, canDeleteDoc, GUEST_ID } from '@/utils/permission'
 import { isDocOverride, isFreshTicketOpen, materializeFromPolicy } from '@/utils/freshness'
+import { isGateStatusOpen } from '@/utils/release'
 import { useAuthStore } from './auth'
 import { useGapStore } from './gap'
 
@@ -100,11 +101,11 @@ export const useKbStore = defineStore('kb', () => {
       const pendingReview = await db.reviews
         .where('docId').equals(id)
         .filter((rv) => rv.status === 'pending').first()
-      // 发布门禁中锁定：待负责人确认/待管理员审批期间候选版本不对外，非管理员不可再写
+      // 发布门禁中锁定：准入阻断/待负责人确认/待管理员审批期间候选版本不对外，非管理员不可再写
       const openGate = existing.release?.activeGateId
         ? await db.releaseGates.get(existing.release.activeGateId)
         : null
-      const gateLocked = openGate && (openGate.status === 'pending_confirm' || openGate.status === 'pending_approval') ? openGate : null
+      const gateLocked = openGate && isGateStatusOpen(openGate.status) ? openGate : null
       // 限时协作授权：以库中最新申请记录判定，撤销/到期保存时立即收回
       let grant = null
       if (!isGuest) {

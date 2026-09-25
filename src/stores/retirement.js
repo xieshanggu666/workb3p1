@@ -14,6 +14,7 @@ import {
 import { GAP } from '@/utils/gap'
 import { isItemOpen } from '@/utils/handover'
 import { GUEST_ID, isGuestUser, ROLE } from '@/utils/permission'
+import { isGateStatusOpen } from '@/utils/release'
 import { useKbStore } from './kb'
 
 // 知识退役替代 store：
@@ -143,7 +144,7 @@ export const useRetirementStore = defineStore('retirement', () => {
 
       // 发布门禁流转中：候选版本尚未放行，先撤回/走完门禁再退役
       const openGateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
-      if (openGateRec && (openGateRec.status === 'pending_confirm' || openGateRec.status === 'pending_approval')) {
+      if (openGateRec && isGateStatusOpen(openGateRec.status)) {
         result = { status: 'in-gate', title: doc.title }; return
       }
 
@@ -243,7 +244,7 @@ export const useRetirementStore = defineStore('retirement', () => {
     const handoverCache = new Map()
     const allGates = await db.releaseGates.toArray()
     const openGateOfDocTx = (id) =>
-      allGates.find((g) => g.docId === id && (g.status === 'pending_confirm' || g.status === 'pending_approval')) || null
+      allGates.find((g) => g.docId === id && isGateStatusOpen(g.status)) || null
     const openRetirementOfDocTx = (id) => {
       if (!openCache.has(id)) openCache.set(id, allRetirements.find((r) => isRetirementOpen(r) && r.docId === id) || null)
       return openCache.get(id)
@@ -399,7 +400,7 @@ export const useRetirementStore = defineStore('retirement', () => {
         .where('docId').equals(docId).filter((rv) => rv.status === 'pending').first()
       if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
       const openGateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
-      if (openGateRec && (openGateRec.status === 'pending_confirm' || openGateRec.status === 'pending_approval')) {
+      if (openGateRec && isGateStatusOpen(openGateRec.status)) {
         result = { status: 'in-gate', title: doc.title }; return
       }
       const handover = await db.handovers
@@ -532,7 +533,7 @@ export const useRetirementStore = defineStore('retirement', () => {
         if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
         // 审批期间旧文档进入发布门禁：候选版本未放行，先处理门禁再退役
         const openGateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
-        if (openGateRec && (openGateRec.status === 'pending_confirm' || openGateRec.status === 'pending_approval')) {
+        if (openGateRec && isGateStatusOpen(openGateRec.status)) {
           result = { status: 'in-gate', title: doc.title }; return
         }
         const handover = await db.handovers.filter((h) => (h.items || []).some((i) => i.docId === doc.id && isItemOpen(i))).first()

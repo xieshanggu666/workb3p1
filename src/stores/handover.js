@@ -9,6 +9,7 @@ import {
   HO_ITEM, REVOKE_MODE, isItemOpen, handoverStatusOf, handoverSnapshotOf, checkHandoverConflicts
 } from '@/utils/handover'
 import { isDocRetired } from '@/utils/retirement'
+import { isGateStatusOpen } from '@/utils/release'
 import { GUEST_ID, isGuestUser, ROLE } from '@/utils/permission'
 import { useKbStore } from './kb'
 import { useAuthStore } from './auth'
@@ -130,7 +131,7 @@ export const useHandoverStore = defineStore('handover', () => {
         if (dupRetire) { result = { status: 'in-retirement', docId: p.docId, title: doc.title }; return }
         // 发布门禁流转中：负责人尚未确认/版本尚未放行，先撤回或走完门禁再交接责任
         const gateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
-        if (gateRec && (gateRec.status === 'pending_confirm' || gateRec.status === 'pending_approval')) {
+        if (gateRec && isGateStatusOpen(gateRec.status)) {
           result = { status: 'in-gate', docId: p.docId, title: doc.title }; return
         }
         const dup = await db.handovers
