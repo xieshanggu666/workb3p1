@@ -1,11 +1,18 @@
-// 知识变更影响评估与发布门禁：状态常量、门禁/发布判定、影响项状态、权限判定与留痕工具（均为纯函数，便于测试）
-// 流程：编辑者保存新版本后发起门禁（关联受影响的问答引用、缺口工单、共享链接）→
-// 负责人（文档拥有者）逐项确认影响并整体确认 → 管理员审批放行（released：版本发布、引用与链接状态回写）
-// / 驳回（rejected：退回编辑者）→ 已放行版本可由管理员回退（rolled_back：版本回退、引用/链接状态还原）。
+// 知识变更影响评估与发布门禁：状态常量、门禁/发布判定、影响项状态、统一发布检查、权限判定与留痕工具（均为纯函数，便于测试）
+// 流程：编辑者保存新版本后发起门禁（关联受影响的问答引用、缺口工单、共享链接，
+// 并统一评估发布检查：评审结论 / 知识保鲜 / 未解决缺口 / 退役关系）→
+// 负责人（文档拥有者）逐项确认影响、豁免负责人级检查项并整体确认 → 管理员豁免管理员级检查项后审批放行
+// （released：版本发布、引用与链接状态回写、已豁免检查联动回写关联实体）/ 驳回（rejected：退回编辑者）→
+// 已放行版本可由管理员回退（rolled_back：版本回退、引用/链接状态还原）。
 // 门禁流转中（pending_confirm / pending_approval）候选版本不对问答/搜索/共享访问暴露，
 // 对外内容一律为门禁发起时锁定的「已发布版」（doc.release.publishedSnapshot）。
+// 统一状态机：检查项随门禁流转重新评估——阻断时把原因回写门禁单（blockedReasons + timeline），
+// 外部条件解除后重新评估自动恢复为「已解除」，存续条件可经对应角色豁免（跨角色审批）。
 import { ROLE, isGuestUser } from './permission'
 import { buildTimelineEntry } from './review'
+import { isFreshDue } from './freshness'
+import { gapStatusLabel } from './gap'
+import { RETIRE } from './retirement'
 
 // 门禁单状态
 export const GATE = {
@@ -37,6 +44,26 @@ export const IMPACT = {
   RELEASED: 'released', // 门禁放行后已生效（引用切新版 / 链接同步 / 工单来源已指向新版）
   REVERTED: 'reverted' // 门禁回退后已还原到门禁前状态
 }
+
+// ---- 统一发布检查（评审结论 / 知识保鲜 / 未解决缺口 / 退役关系）----
+
+// 检查维度（随门禁单 checks 持久化，随流转重新评估）
+export const CHECK_TYPE = {
+  REVIEW: 'review', // 评审结论：流转中的评审单（不可豁免）/ 最近一次评审结论为驳回
+  FRESHNESS: 'freshness', // 知识保鲜：复核单待整改/被驳回/送审中，或复核周期已到点
+  GAP: 'gap', // 未解决缺口：关联本文档且未解决（处理中/送审中）的缺口工单
+  RETIREMENT: 'retirement' // 退役关系：本文档正作为他人在途/生效退役的替代文档
+}
+
+// 检查项状态
+export const CHECK = {
+  BLOCKED: 'blocked', // 阻断中：须先解除条件，或经对应角色豁免
+  WAIVED: 'waived', // 已豁免：对应角色确认风险可接受（跨角色审批留痕）
+  PASS: 'pass' // 已解除：条件已消除（重新评估后的状态恢复，保留留痕）
+}
+
+// 豁免所需角色（跨角色审批）：owner=文档负责人（或管理员）；admin=仅管理员；null=不可豁免，须先解除条件
+export const CHECK_ROLE = { OWNER: 'owner', ADMIN: 'admin' }
 
 export function gateStatusLabel(status) {
   return {
@@ -248,6 +275,155 @@ export function impactCounts(impacts) {
   return c
 }
 
+// ---- 统一发布检查：评估 / 重估合并 / 流转闸门 / 豁免资格 ----
+
+export function checkTypeLabel(type) {
+  return { review: '评审结论', freshness: '知识保鲜', gap: '未解决缺口', retirement: '退役关系' }[type] || type
+}
+
+export function checkStateLabel(state) {
+  return { blocked: '阻断中', waived: '已豁免', pass: '已解除' }[state] || state
+}
+
+export function checkApproverLabel(role) {
+  return role === CHECK_ROLE.ADMIN ? '需管理员豁免' : role === CHECK_ROLE.OWNER ? '需负责人确认' : '须先解除条件'
+}
+
+// 评估发布检查项（纯函数；原始数据由调用方在事务内收集，便于测试）：
+// 对评审结论、知识保鲜、未解决缺口、退役关系四个维度生成「阻断中」检查项；无发现即全部通过（不生成项）。
+// 返回 [{ key, type, refId, title, detail, state, approverRole, blockedReason, waivedBy, waivedAt, waiveNote, resolvedAt }]
+export function evaluateChecks({ doc, pendingReview, openFreshTicket, unresolvedGaps, replacementOf }, now = new Date().toISOString()) {
+  const items = []
+  const push = (it) => items.push({
+    state: CHECK.BLOCKED, waivedBy: null, waivedAt: null, waiveNote: '', resolvedAt: null, ...it
+  })
+
+  // ① 评审结论
+  if (pendingReview) {
+    push({
+      key: 'review:pending:' + pendingReview.id, type: CHECK_TYPE.REVIEW, refId: pendingReview.id,
+      title: '存在流转中的评审单',
+      detail: '评审单完结（审批/撤回）后自动解除',
+      approverRole: null,
+      blockedReason: '文档存在待审批的评审单，须先完结评审'
+    })
+  }
+  const last = doc?.lastReview
+  if (last && last.status === 'rejected') {
+    push({
+      key: 'review:last-rejected:' + (last.reviewId || 'unknown'), type: CHECK_TYPE.REVIEW, refId: last.reviewId || null,
+      title: '最近一次评审结论为「驳回」',
+      detail: last.note ? '驳回意见：' + last.note : '需确认本次版本已处理驳回意见',
+      approverRole: CHECK_ROLE.OWNER,
+      blockedReason: '最近一次评审被驳回，需负责人确认本次版本已处理驳回意见'
+    })
+  }
+
+  // ② 知识保鲜
+  if (openFreshTicket) {
+    const t = openFreshTicket
+    push({
+      key: 'freshness:' + t.id, type: CHECK_TYPE.FRESHNESS, refId: t.id,
+      title: '知识保鲜第 ' + t.round + ' 轮复核' +
+        (t.status === 'rejected' ? '被驳回，待整改' : t.status === 'submitted' ? '送审中' : '到期，待整改'),
+      detail: '复核通过或负责人确认风险后可继续',
+      approverRole: CHECK_ROLE.OWNER,
+      blockedReason: '知识保鲜复核未结案（问答引用已暂停），需负责人确认继续发布'
+    })
+  } else if (isFreshDue(doc, now)) {
+    push({
+      key: 'freshness:due', type: CHECK_TYPE.FRESHNESS, refId: null,
+      title: '知识保鲜复核周期已到点',
+      detail: '复核单即将生成，完成本轮复核或负责人确认后可继续',
+      approverRole: CHECK_ROLE.OWNER,
+      blockedReason: '知识保鲜复核周期已到点，需负责人确认继续发布'
+    })
+  }
+
+  // ③ 未解决缺口（已解决工单列入影响项，不在此重复）
+  for (const t of unresolvedGaps || []) {
+    push({
+      key: 'gap:' + t.id, type: CHECK_TYPE.GAP, refId: t.id,
+      title: '未解决缺口：' + (t.question || t.id),
+      detail: '工单状态：' + gapStatusLabel(t.status),
+      approverRole: CHECK_ROLE.OWNER,
+      blockedReason: '关联缺口工单未解决（' + gapStatusLabel(t.status) + '），需负责人确认本次发布不覆盖该缺口'
+    })
+  }
+
+  // ④ 退役关系（替代链上的版本变更影响已退役文档的引用指向，需管理员确认）
+  for (const r of replacementOf || []) {
+    const open = r.status === RETIRE.PENDING
+    push({
+      key: 'retirement:replacement:' + r.id, type: CHECK_TYPE.RETIREMENT, refId: r.id,
+      title: '本文档是《' + (r.docTitle || r.docId) + '》的退役替代文档',
+      detail: open ? '该退役单待审批，批准后引用将指向本文档' : '已退役文档的引用正指向本文档',
+      approverRole: CHECK_ROLE.ADMIN,
+      blockedReason: open
+        ? '存在以本文档为替代文档的在途退役，版本发布需管理员确认'
+        : '本文档承载已退役文档的引用，版本发布需管理员确认'
+    })
+  }
+  return items
+}
+
+// 重新评估合并（纯函数）：新一轮评估结果与门禁单上既有检查项合并——
+// - 同一条件（key 相同）已被豁免且仍存续：豁免结论持续有效（不重复要求确认）；
+// - 条件已消除（新一轮不再出现）：恢复为「已解除」并记录恢复时间（重新评估后的状态恢复，保留留痕）；
+// - 新出现的条件：生成新的阻断项。
+export function mergeChecks(prevChecks, nextItems, now = new Date().toISOString()) {
+  const prevByKey = new Map((prevChecks || []).map((c) => [c.key, c]))
+  const out = []
+  for (const item of nextItems || []) {
+    const old = prevByKey.get(item.key)
+    if (old && old.state === CHECK.WAIVED) {
+      out.push({ ...item, state: CHECK.WAIVED, waivedBy: old.waivedBy, waivedAt: old.waivedAt, waiveNote: old.waiveNote })
+    } else {
+      out.push(item)
+    }
+    prevByKey.delete(item.key)
+  }
+  for (const old of prevByKey.values()) {
+    out.push({ ...old, state: CHECK.PASS, resolvedAt: old.resolvedAt || now })
+  }
+  return out
+}
+
+// 负责人整体确认前：负责人级与不可豁免检查必须全部解除/豁免（管理员级检查留待审批环节）
+export function ownerChecksCleared(checks) {
+  return (checks || []).every((c) => c.state !== CHECK.BLOCKED || c.approverRole === CHECK_ROLE.ADMIN)
+}
+
+// 管理员放行前：全部检查必须解除/豁免
+export function allChecksCleared(checks) {
+  return (checks || []).every((c) => c.state !== CHECK.BLOCKED)
+}
+
+// 当前阻断原因汇总（阻断原因回写门禁单 blockedReasons 用）
+export function blockedReasonsOf(checks, now = new Date().toISOString()) {
+  return (checks || [])
+    .filter((c) => c.state === CHECK.BLOCKED)
+    .map((c) => ({ key: c.key, type: c.type, title: c.title, reason: c.blockedReason, approverRole: c.approverRole || null, at: now }))
+}
+
+// 豁免资格（跨角色审批）：门禁流转中 + 检查项阻断中 + 维度可豁免 + 当前用户为对应角色
+// （owner 级：文档负责人或管理员；admin 级：仅管理员；approverRole 为 null 不可豁免）
+export function canWaiveCheck(gate, check, doc, userId, role) {
+  if (!isGateOpen(gate) || !check || check.state !== CHECK.BLOCKED || !check.approverRole) return false
+  if (isGuestUser(userId)) return false
+  if (role === ROLE.ADMIN) return true
+  return check.approverRole === CHECK_ROLE.OWNER && !!doc && doc.ownerId === userId
+}
+
+// 检查项计数（面板/中心展示用）
+export function checkCounts(checks) {
+  const c = { total: (checks || []).length, blocked: 0, waived: 0, pass: 0 }
+  for (const it of checks || []) {
+    if (c[it.state] !== undefined) c[it.state]++
+  }
+  return c
+}
+
 // ---- 问答引用影响推荐（提交门禁时自动勾选）----
 // 以问题关键词对目标文档打分，命中（score>0）即视为「本次版本变更可能影响到的问答引用」。
 // scoreDoc 由调用方注入（复用 utils/qa.scoreDoc），避免本模块依赖检索实现
@@ -295,6 +471,12 @@ export function gateTimelineLabel(action) {
     reject: '管理员审批驳回',
     withdraw: '撤回升版门禁',
     rollback: '管理员回退版本',
+    // 统一发布检查（评审结论/知识保鲜/未解决缺口/退役关系）
+    'gate-blocked': '流转被阻断 · 阻断原因已回写',
+    'gate-resumed': '阻断条件解除 · 恢复流转',
+    'check-waive': '豁免发布检查项',
+    'gate-recheck': '重新评估发布检查',
+    'checks-release': '豁免检查项随放行生效',
     // 放行时的联动结果
     'version-publish': '版本发布 · 问答引用切换至新版',
     'share-sync': '共享链接状态随发布同步',

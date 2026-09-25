@@ -8,7 +8,8 @@ import DocPill from '@/components/common/DocPill.vue'
 import { formatDate, formatFull } from '@/utils/format'
 import {
   GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
-  impactTypeLabel, impactStatusLabel, impactCounts, IMPACT
+  impactTypeLabel, impactStatusLabel, impactCounts, IMPACT,
+  checkTypeLabel, checkStateLabel, checkApproverLabel, checkCounts, canWaiveCheck
 } from '@/utils/release'
 import { diffVersionFields, fieldLabels } from '@/utils/version'
 
@@ -65,6 +66,7 @@ async function confirmAll(g) {
   const res = await releaseStore.confirmGate(g.id, (confirmNoteMap.value[g.id] || '').trim(), auth.user)
   if (res.status === 'ok') confirmNoteMap.value[g.id] = ''
   else if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
+  else if (res.status === 'blocked') alert('仍存在阻断中的发布检查项：\n' + (res.reasons || []).map((x) => '· ' + x.title).join('\n'))
 }
 
 async function withdraw(g) {
@@ -80,6 +82,7 @@ async function decide(g, decision) {
     const res = await releaseStore.decideGate(g.id, decision, (decideNoteMap.value[g.id] || '').trim(), auth.user)
     if (res.status === 'ok') decideNoteMap.value[g.id] = ''
     else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
+    else if (res.status === 'blocked') alert('放行被阻断，仍存在未解除的发布检查项：\n' + (res.reasons || []).map((x) => '· ' + x.title).join('\n'))
     else alert('操作失败：门禁状态已变化')
   } finally {
     busyId.value = ''
@@ -98,6 +101,32 @@ function impactIcon(type) {
   return { citation: '🤖', ticket: '📮', share: '🔗' }[type] || '•'
 }
 
+// 豁免发布检查项（跨角色审批：负责人级由拥有者/管理员豁免，管理员级仅管理员）
+const canWaive = (g, c) => canWaiveCheck(g, c, docById.value[g.docId] || null, auth.user?.id, auth.user?.role)
+
+async function waive(g, c) {
+  const note = window.prompt('豁免说明（将写入门禁留痕，可留空）：') || ''
+  const res = await releaseStore.waiveCheck(g.id, c.key, note, auth.user)
+  if (res.status === 'denied') alert('该检查项需 ' + (c.approverRole === 'admin' ? '管理员' : '文档负责人') + ' 豁免。')
+  else if (res.status !== 'ok') alert('操作失败：检查项状态已变化')
+}
+
+// 重新评估发布检查：外部条件解除（工单解决/复核通过/评审完结/退役处理）后恢复流转
+async function recheck(g) {
+  const res = await releaseStore.recheckGate(g.id, auth.user)
+  if (res.status === 'ok') {
+    if (res.emerged?.length) alert('重新评估发现新增阻断 ' + res.emerged.length + ' 项，已回写门禁单。')
+  } else if (res.status === 'denied') {
+    alert('仅发起人、文档负责人或管理员可以重新评估。')
+  } else if (res.status !== 'closed') {
+    alert('操作失败：门禁状态已变化')
+  }
+}
+
+function checkIcon(type) {
+  return { review: '📝', freshness: '🧊', gap: '📮', retirement: '🗄️' }[type] || '•'
+}
+
 onMounted(async () => {
   await Promise.all([releaseStore.loadAll(), kb.loadAll()])
 })
@@ -107,7 +136,7 @@ onMounted(async () => {
   <div class="gc-page">
     <header class="head">
       <h2>🚦 发布门禁</h2>
-      <p class="sub">编辑者提交版本后关联受影响的问答引用、缺口工单与共享链接 → 负责人确认影响 → 管理员审批放行或回退，版本发布、引用与链接状态自动回写。</p>
+      <p class="sub">编辑者提交版本后关联受影响的问答引用、缺口工单与共享链接，并统一评估评审结论、知识保鲜、未解决缺口与退役关系 → 负责人确认影响、豁免负责人级检查 → 管理员豁免管理级检查并审批放行或回退；阻断原因实时回写门禁单，条件解除后重新评估自动恢复。</p>
       <div class="tabs">
         <button :class="{ on: tab === 'todo' }" @click="tab = 'todo'">待我处理 <em>{{ counts.todo }}</em></button>
         <button :class="{ on: tab === 'mine' }" @click="tab = 'mine'">我提交的 <em>{{ counts.mine }}</em></button>
@@ -170,6 +199,36 @@ onMounted(async () => {
               @click="confirmItem(g, it.key)"
             >确认</button>
           </div>
+        </div>
+
+        <!-- 统一发布检查：评审结论 / 知识保鲜 / 未解决缺口 / 退役关系 -->
+        <div v-if="g.status === GATE.PENDING_CONFIRM || g.status === GATE.PENDING_APPROVAL" class="checks">
+          <div class="chk-head">
+            <span class="chk-title">发布检查（{{ checkCounts(g.checks).blocked }} 项阻断 · {{ checkCounts(g.checks).waived }} 项已豁免）</span>
+            <button class="btn xs ghost" @click="recheck(g)">↻ 重新检查</button>
+          </div>
+          <div v-if="g.blockedReasons?.length" class="blocked-banner">
+            <div class="bb-title">⛔ 上次流转被阻断（{{ formatFull(g.blockedAt) }}），阻断原因已回写：</div>
+            <div v-for="r in g.blockedReasons" :key="r.key" class="bb-item">· {{ r.title }} — {{ r.reason }}</div>
+          </div>
+          <div v-if="!(g.checks || []).length" class="chk-empty">✅ 评审结论 / 知识保鲜 / 未解决缺口 / 退役关系四项检查均通过</div>
+          <div v-for="c in g.checks || []" :key="c.key" class="check" :class="'ck-' + c.state">
+            <span class="ck-ico">{{ checkIcon(c.type) }}</span>
+            <div class="ck-body">
+              <div class="ck-title">{{ c.title }}</div>
+              <div class="ck-sub">
+                <span class="ck-type">{{ checkTypeLabel(c.type) }}</span>
+                <span v-if="c.state === 'blocked'">{{ c.blockedReason }}（{{ checkApproverLabel(c.approverRole) }}）</span>
+                <span v-else-if="c.state === 'waived'">已由 {{ userName(c.waivedBy) }} 豁免<span v-if="c.waiveNote">：“{{ c.waiveNote }}”</span></span>
+                <span v-else>条件已解除</span>
+              </div>
+            </div>
+            <span class="ck-state">{{ checkStateLabel(c.state) }}</span>
+            <button v-if="canWaive(g, c)" class="btn xs" @click="waive(g, c)">豁免</button>
+          </div>
+        </div>
+        <div v-else-if="checkCounts(g.checks).waived" class="checks-compact">
+          发布检查：含 {{ checkCounts(g.checks).waived }} 项已豁免检查（跨角色确认留痕）
         </div>
 
         <!-- 操作区 -->
@@ -257,6 +316,24 @@ onMounted(async () => {
 .im-pending .im-state { color: #b45309; }
 .im-reverted .im-state { color: var(--text-3); }
 .btn.xs { padding: 2px 10px; font-size: 12px; }
+.checks { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.chk-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; color: var(--text-2); margin-bottom: 8px; }
+.chk-empty { font-size: 12.5px; color: #15803d; }
+.blocked-banner { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+.bb-title { font-size: 12px; font-weight: 600; color: #b91c1c; margin-bottom: 4px; }
+.bb-item { font-size: 12px; color: #7f1d1d; padding: 1px 0; word-break: break-word; }
+.check { display: flex; gap: 10px; align-items: flex-start; padding: 7px 8px; border-radius: 8px; }
+.check.ck-waived { background: #fffbeb; }
+.check.ck-pass { opacity: 0.65; }
+.ck-ico { font-size: 14px; line-height: 1.5; }
+.ck-body { flex: 1; min-width: 0; }
+.ck-title { font-size: 13px; word-break: break-word; }
+.ck-sub { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; font-size: 11.5px; color: var(--text-3); }
+.ck-type { background: var(--panel-2); color: var(--text-2); border-radius: 999px; padding: 0 8px; }
+.ck-state { font-size: 12px; white-space: nowrap; color: #b91c1c; }
+.ck-waived .ck-state { color: #b45309; }
+.ck-pass .ck-state { color: #15803d; }
+.checks-compact { margin-top: 10px; font-size: 12px; color: #b45309; }
 .acts { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 12px; }
 .acts textarea, .acts input { width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; outline: none; }
 .acts textarea { resize: vertical; }

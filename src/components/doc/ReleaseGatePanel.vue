@@ -7,7 +7,8 @@ import { useReleaseStore } from '@/stores/release'
 import { formatFull, formatDate } from '@/utils/format'
 import {
   GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
-  impactTypeLabel, impactStatusLabel, IMPACT
+  impactTypeLabel, impactStatusLabel, IMPACT,
+  checkTypeLabel, checkStateLabel, checkApproverLabel, checkCounts, canWaiveCheck
 } from '@/utils/release'
 import { diffVersionFields, fieldLabels } from '@/utils/version'
 
@@ -71,6 +72,10 @@ async function submit() {
       alert('文档正在评审中，请待评审完结后再提交发布门禁。')
     } else if (res.status === 'in-handover') {
       alert('文档正在责任交接中，请先完成或取消交接后再提交发布门禁。')
+    } else if (res.status === 'retired') {
+      alert('文档已退役，为只读归档，不能再发起发布门禁。')
+    } else if (res.status === 'in-retirement') {
+      alert('文档正在退役审批中，请先完成或撤销退役流程后再提交发布门禁。')
     } else if (res.status === 'no-change') {
       alert('当前版本与已发布版本内容一致，无需提交门禁；请先编辑保存新版本。')
     } else {
@@ -96,6 +101,7 @@ async function confirmAll() {
   if (res.status === 'ok') { confirmNote.value = '' }
   else if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
   else if (res.status === 'unconfirmed') alert('仍有影响项未确认。')
+  else if (res.status === 'blocked') alert('仍存在阻断中的发布检查项：\n' + (res.reasons || []).map((x) => '· ' + x.title).join('\n'))
 }
 
 async function withdraw(g) {
@@ -108,7 +114,34 @@ async function decide(g, decision) {
   const res = await releaseStore.decideGate(g.id, decision, (decideNote.value[g.id] || '').trim(), auth.user)
   if (res.status === 'ok') { decideNote.value = { ...decideNote.value, [g.id]: '' } }
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
+  else if (res.status === 'blocked') alert('放行被阻断，仍存在未解除的发布检查项：\n' + (res.reasons || []).map((x) => '· ' + x.title).join('\n'))
   else alert('操作失败：门禁状态已变化')
+}
+
+// 豁免发布检查项（跨角色审批：负责人级由拥有者/管理员豁免，管理员级仅管理员）
+const canWaive = (c) => canWaiveCheck(openGate.value, c, props.doc, auth.user?.id, auth.user?.role)
+
+async function waive(c) {
+  const note = window.prompt('豁免说明（将写入门禁留痕，可留空）：') || ''
+  const res = await releaseStore.waiveCheck(openGate.value.id, c.key, note, auth.user)
+  if (res.status === 'denied') alert('该检查项需 ' + (c.approverRole === 'admin' ? '管理员' : '文档负责人') + ' 豁免。')
+  else if (res.status !== 'ok') alert('操作失败：检查项状态已变化')
+}
+
+// 重新评估发布检查：外部条件解除（工单解决/复核通过/评审完结/退役处理）后恢复流转
+async function recheck() {
+  const res = await releaseStore.recheckGate(openGate.value.id, auth.user)
+  if (res.status === 'ok') {
+    if (res.emerged?.length) alert('重新评估发现新增阻断 ' + res.emerged.length + ' 项，已回写门禁单。')
+  } else if (res.status === 'denied') {
+    alert('仅发起人、文档负责人或管理员可以重新评估。')
+  } else if (res.status !== 'closed') {
+    alert('操作失败：门禁状态已变化')
+  }
+}
+
+function checkIcon(type) {
+  return { review: '📝', freshness: '🧊', gap: '📮', retirement: '🗄️' }[type] || '•'
 }
 
 async function rollback(g) {
@@ -133,7 +166,7 @@ onMounted(() => releaseStore.loadAll())
       <button v-if="canSubmit && !showForm" class="btn sm primary" @click="showForm = true">提交版本发布门禁</button>
     </div>
     <p class="gp-submit-hint" v-if="!records.length && !showForm">
-      编辑保存新版本后，可在此提交发布门禁：自动关联受影响的问答引用、缺口工单与共享链接，负责人确认影响、管理员审批放行后版本才会对外发布。
+      编辑保存新版本后，可在此提交发布门禁：自动关联受影响的问答引用、缺口工单与共享链接，并统一评估评审结论、知识保鲜、未解决缺口与退役关系；负责人确认影响、跨角色豁免检查、管理员审批放行后版本才会对外发布。
     </p>
 
     <!-- 提交表单 -->
@@ -188,6 +221,33 @@ onMounted(() => releaseStore.loadAll())
         </div>
       </div>
 
+      <!-- 统一发布检查：评审结论 / 知识保鲜 / 未解决缺口 / 退役关系 -->
+      <div class="checks">
+        <div class="chk-head">
+          <span class="chk-title">发布检查（{{ checkCounts(openGate.checks).blocked }} 项阻断 · {{ checkCounts(openGate.checks).waived }} 项已豁免）</span>
+          <button class="btn xs ghost" @click="recheck">↻ 重新检查</button>
+        </div>
+        <div v-if="openGate.blockedReasons?.length" class="blocked-banner">
+          <div class="bb-title">⛔ 上次流转被阻断（{{ formatFull(openGate.blockedAt) }}），阻断原因已回写：</div>
+          <div v-for="r in openGate.blockedReasons" :key="r.key" class="bb-item">· {{ r.title }} — {{ r.reason }}</div>
+        </div>
+        <div v-if="!(openGate.checks || []).length" class="chk-empty">✅ 评审结论 / 知识保鲜 / 未解决缺口 / 退役关系四项检查均通过</div>
+        <div v-for="c in openGate.checks || []" :key="c.key" class="check" :class="'ck-' + c.state">
+          <span class="ck-ico">{{ checkIcon(c.type) }}</span>
+          <div class="ck-body">
+            <div class="ck-title">{{ c.title }}</div>
+            <div class="ck-sub">
+              <span class="ck-type">{{ checkTypeLabel(c.type) }}</span>
+              <span v-if="c.state === 'blocked'">{{ c.blockedReason }}（{{ checkApproverLabel(c.approverRole) }}）</span>
+              <span v-else-if="c.state === 'waived'">已由 {{ userName(c.waivedBy) }} 豁免<span v-if="c.waiveNote">：“{{ c.waiveNote }}”</span></span>
+              <span v-else>条件已解除 · {{ formatDate(c.resolvedAt) }}</span>
+            </div>
+          </div>
+          <span class="ck-state">{{ checkStateLabel(c.state) }}</span>
+          <button v-if="canWaive(c)" class="btn xs" @click="waive(c)">豁免</button>
+        </div>
+      </div>
+
       <!-- 负责人整体确认 -->
       <div v-if="openGate.status === GATE.PENDING_CONFIRM && isOwner" class="go-confirm">
         <textarea v-model="confirmNote" rows="2" placeholder="影响确认意见（可选，提交管理员审批）"></textarea>
@@ -224,6 +284,7 @@ onMounted(() => releaseStore.loadAll())
       </div>
       <div class="gd-note" v-if="lastGate.decisionNote">审批意见：“{{ lastGate.decisionNote }}”</div>
       <div class="gd-note" v-else-if="lastGate.rollbackNote">回退说明：“{{ lastGate.rollbackNote }}”</div>
+      <div v-if="checkCounts(lastGate.checks).waived" class="gd-checks">含 {{ checkCounts(lastGate.checks).waived }} 项已豁免发布检查（跨角色确认留痕）</div>
       <div v-if="isAdmin && lastGate.status === GATE.RELEASED" class="gd-rollback">
         <input :value="rollbackNote[lastGate.id] || ''" placeholder="回退原因（可选）" @input="rollbackNote[lastGate.id] = $event.target.value" />
         <button class="btn sm danger-ghost" @click="rollback(lastGate)">↩ 回退该版本</button>
@@ -284,6 +345,23 @@ onMounted(() => releaseStore.loadAll())
 .im-pending .im-state { color: #b45309; }
 .im-reverted .im-state { color: var(--text-3); }
 .btn.xs { padding: 2px 10px; font-size: 12px; }
+.checks { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.chk-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; color: var(--text-2); margin-bottom: 8px; }
+.chk-empty { font-size: 12.5px; color: #15803d; }
+.blocked-banner { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+.bb-title { font-size: 12px; font-weight: 600; color: #b91c1c; margin-bottom: 4px; }
+.bb-item { font-size: 12px; color: #7f1d1d; padding: 1px 0; word-break: break-word; }
+.check { display: flex; gap: 10px; align-items: flex-start; padding: 7px 8px; border-radius: 8px; }
+.check.ck-waived { background: #fffbeb; }
+.check.ck-pass { opacity: 0.65; }
+.ck-ico { font-size: 14px; line-height: 1.5; }
+.ck-body { flex: 1; min-width: 0; }
+.ck-title { font-size: 13px; word-break: break-word; }
+.ck-sub { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; font-size: 11.5px; color: var(--text-3); }
+.ck-type { background: var(--panel-2); color: var(--text-2); border-radius: 999px; padding: 0 8px; }
+.ck-state { font-size: 12px; white-space: nowrap; color: #b91c1c; }
+.ck-waived .ck-state { color: #b45309; }
+.ck-pass .ck-state { color: #15803d; }
 .go-confirm { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
 .go-decide { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
 .go-wait { margin-top: 10px; font-size: 12.5px; color: var(--text-2); display: flex; gap: 10px; align-items: center; }
@@ -299,6 +377,7 @@ onMounted(() => releaseStore.loadAll())
 .gd-ver { font-weight: 600; }
 .gd-time { margin-left: auto; color: var(--text-3); font-size: 12px; }
 .gd-note { margin-top: 6px; font-size: 12.5px; color: var(--text-2); }
+.gd-checks { margin-top: 6px; font-size: 12px; color: #b45309; }
 .gd-rollback { display: flex; gap: 8px; margin-top: 8px; }
 .gd-rollback input { flex: 1; border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12.5px; outline: none; }
 .gp-timeline { margin-top: 10px; }

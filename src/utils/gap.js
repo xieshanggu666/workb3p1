@@ -107,6 +107,7 @@ export function gapTimelineLabel(action) {
     submit: '关联文档送审',
     resolve: '审批通过 · 回填答案来源',
     return: '退回处理',
-    reset: '关联文档已删除'
+    reset: '关联文档已删除',
+    'gate-release': '关联文档经发布门禁放行（缺口未解决已豁免）'
   }[action] || action
 }

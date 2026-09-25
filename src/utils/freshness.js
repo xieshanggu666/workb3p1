@@ -155,6 +155,7 @@ export function freshTimelineLabel(action) {
     'policy-change': '调整分类复核策略 · 重算到期计划',
     'policy-disable': '关闭分类复核策略 · 退出知识保鲜',
     'policy-convert': '分类策略已关闭 · 按规则快照转为文档级配置',
+    'gate-release': '发布门禁放行（复核未结案已豁免）',
     handover: '负责人交接 · 保鲜责任转移'
   }[action] || action
 }

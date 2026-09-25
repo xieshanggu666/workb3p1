@@ -123,6 +123,8 @@ export function retireTimelineLabel(action) {
     // 撤销退役时的联动结果
     'gap-restore': '答案来源回挂旧文档',
     'share-restore': '共享链接随撤销退役恢复',
+    // 替代文档经发布门禁发布新版本（替代链留痕）
+    'replacement-release': '替代文档经发布门禁发布新版本',
     // 编排作业（可重试分批编排）
     'batch-job': '分批编排作业',
     'batch-approve-all': '批量批准编排',
